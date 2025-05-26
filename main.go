@@ -16,22 +16,8 @@ import (
 
 func main() {
 	// Start background worker in a goroutine
-	go backgroundWorker()
-	// Keep main running so the program doesn't exit
-	select {} // This blocks forever
-}
-
-// This is the background job that runs forever
-func backgroundWorker() {
 	redisConnection := os.Getenv("BN_REDIS_URL")
 	dbConnection := os.Getenv("BN_DB_URL")
-	var ctx = context.Background()
-	var WAIT_INTERVAL = (27 * time.Second)
-	var cursor uint64 = 0
-	var matchPattern = "tmvh-transaction-callback-api:*" // Pattern to match keys
-	var count = int64(100)                               // Limit to 100 keys per scan
-
-	fmt.Println("##### TMVH TRANSACTION WORKER RUNNING #####")
 	//config redis pool
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisConnection, // Change if needed
@@ -50,9 +36,25 @@ func backgroundWorker() {
 		log.Fatal("Failed to get generic database object:", err)
 	}
 	// Set connection pool settings
-	sqlDB.SetMaxOpenConns(100)                 // Maximum number of open connections
-	sqlDB.SetMaxIdleConns(10)                  // Maximum number of idle connections
-	sqlDB.SetConnMaxLifetime(10 * time.Minute) // Connection max lifetime
+	sqlDB.SetMaxOpenConns(100)                // Maximum number of open connections
+	sqlDB.SetMaxIdleConns(10)                 // Maximum number of idle connections
+	sqlDB.SetConnMaxLifetime(5 * time.Minute) // Connection max lifetime
+	go backgroundWorker(rdb, db)
+
+	// Keep main running so the program doesn't exit
+	select {} // This blocks forever
+}
+
+// This is the background job that runs forever
+func backgroundWorker(rdb *redis.Client, db *gorm.DB) {
+
+	var ctx = context.Background()
+	var WAIT_INTERVAL = (27 * time.Second)
+	var cursor uint64 = 0
+	var matchPattern = "tmvh-transaction-callback-api:*" // Pattern to match keys
+	var count = int64(100)                               // Limit to 100 keys per scan
+
+	fmt.Println("##### TMVH TRANSACTION WORKER RUNNING #####")
 
 	var wg sync.WaitGroup
 
