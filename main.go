@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -54,7 +57,7 @@ func backgroundWorker(rdb *redis.Client, db *gorm.DB) {
 	var matchPattern = "tmvh-transaction-callback-api:*" // Pattern to match keys
 	var count = int64(100)                               // Limit to 100 keys per scan
 
-	fmt.Println("##### TMVH TRANSACTION WORKER RUNNING #####")
+	fmt.Println("##### TMVH TRANSACTION WORKER RUNNING DON'T CLOSE TERMINAL #####")
 
 	var wg sync.WaitGroup
 
@@ -87,7 +90,7 @@ func backgroundWorker(rdb *redis.Client, db *gorm.DB) {
 		cursor = newCursor
 		// If the cursor is 0, then the scan is complete
 		if cursor == 0 {
-			fmt.Println("Wait for next scan")
+			//fmt.Println("Wait for next scan")
 			time.Sleep(WAIT_INTERVAL)
 			//break
 		}
@@ -130,18 +133,128 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	errTransactionnData := json.Unmarshal([]byte(jsonString), &transactionData)
 	if errTransactionnData != nil {
 		fmt.Println("JSON Marshal error : ", errTransactionnData)
-		return fmt.Errorf("JSON DECODE ERROR : " + errTransactionnData.Error())
+		//return fmt.Errorf("JSON DECODE ERROR : " + errTransactionnData.Error())
+	}
+
+	type PartnerData struct {
+		Id                uint   `json:"id"`
+		Keyword           string `json:"keyword"`
+		Shortcode         string `json:"shortcode"`
+		Telcoid           string `json:"telcoid"`
+		Ads_id            string `json:"ads_id"`
+		Client_partner_id string `json:"client_partner_id"`
+		Wap_aoc_refid     int    `json:"wap_aoc_refid"`
+		Wap_aoc_id        string `json:"wap_aoc_id"`
+		Wap_aoc_media     int    `json:"wap_aoc_media"`
+		Postback_url      string `json:"postback_url"`
+		Dn_url            string `json:"dn_url"`
+		Postback_counter  int    `json:"postback_counter"`
+	}
+
+	//Table name on database
+	type client_services struct {
+		//ID is the primary key, auto-incremented by the database sequence.
+		ID              uint   `gorm:"column:id;primaryKey"`
+		Keyword         string `gorm:"column:keyword"`                    // varchar NULL in SQL, using pointer for explicit nullability
+		Shortcode       string `gorm:"column:shortcode"`                  // varchar NULL in SQL, using pointer for explicit nullability
+		TelcoID         string `gorm:"column:telcoid"`                    // varchar NULL in SQL, using pointer for explicit nullability
+		AdsID           string `gorm:"column:ads_id"`                     // varchar NULL in SQL, using pointer for explicit nullability
+		ClientPartnerID string `gorm:"column:client_partner_id;not null"` // varchar NOT NULL in SQL
+		WapAOCRefID     string `gorm:"column:wap_aoc_refid"`              // varchar NULL in SQL, using pointer for explicit nullability
+		WapAOCID        string `gorm:"column:wap_aoc_id"`                 // varchar NULL in SQL, using pointer for explicit nullability
+		WapAOCMedia     string `gorm:"column:wap_aoc_media"`              // varchar NULL in SQL, using pointer for explicit nullability
+		PostbackURL     string `gorm:"column:postback_url"`               // varchar NULL in SQL, using pointer for explicit nullability
+		DNURL           string `gorm:"column:dn_url"`                     // varchar NULL in SQL, using pointer for explicit nullability
+		PostbackCounter int    `gorm:"column:postback_counter"`           // int4 NULL in SQL, using pointer for explicit nullability
+	}
+
+	var partnerData PartnerData
+	errPartnerData := json.Unmarshal([]byte(jsonString), &partnerData)
+	if errPartnerData != nil {
+		fmt.Println("partnerData : ", errPartnerData)
+		//return fmt.Errorf("partnerData : " + errPartnerData.Error())
+	}
+
+	partnerDataEntry := client_services{
+		DNURL:           partnerData.Dn_url,
+		PostbackURL:     partnerData.Postback_url,
+		PostbackCounter: int(partnerData.Postback_counter),
+	}
+
+	var telco_operator = "0"
+	if transactionData.Operator == "TRUEMOVE" {
+		telco_operator = "1"
+	}
+	if transactionData.Operator == "DTAC" {
+		telco_operator = "2"
+	}
+	if transactionData.Operator == "AIS" {
+		telco_operator = "3"
+	}
+	queryRes := db.Where("shortcode = ? and telcoid = ?", transactionData.Shortcode, telco_operator).First(&partnerDataEntry)
+	if queryRes.Error != nil {
+		if queryRes.Error == gorm.ErrRecordNotFound {
+			fmt.Println("not found.")
+		} else {
+			log.Printf("Error finding : %v", queryRes.Error)
+		}
+	} else {
+
+		//fmt.Println("DN URL : ", partnerDataEntry.DNURL)
+		//fmt.Println("POSTBACK URL : ", partnerDataEntry.PostbackURL)
+		//fmt.Println("COUNTER : ", partnerDataEntry.PostbackCounter)
+		// Define parameters as a map
+		params := map[string]string{
+			"msisdn":     transactionData.Msisdn,
+			"operator":   transactionData.Operator, // Value with spaces
+			"tran_ref":   transactionData.TranRef,  // Another value with spaces and special char
+			"short_code": transactionData.Shortcode,
+			"code":       transactionData.Code,
+			"desc":       transactionData.Desc,
+			"timestamp":  strconv.FormatInt(int64(transactionData.Timestamp), 10),
+		}
+		// Use url.Values to build and URL-encode the query string
+		queryParams := url.Values{}
+		for key, value := range params {
+			queryParams.Add(key, value) // Automatically encodes key and value
+		}
+		// Construct the full URL with the encoded query string
+		paramTargetURL := fmt.Sprintf("%s?%s", partnerDataEntry.DNURL, queryParams.Encode())
+		//log.Printf("GET request URL with parameters: %s", paramTargetURL)
+		// Create an HTTP client with a timeout
+		client := http.Client{
+			Timeout: 10 * time.Second, // Set a timeout for the request
+		}
+
+		// Make the HTTP GET request
+		resp, err := client.Get(paramTargetURL)
+		if err != nil {
+			fmt.Println("failed to make GET request to ", resp, err)
+		}
+		defer resp.Body.Close() // Ensure the response body is closed after reading
+
+		// Check the HTTP status code
+		if resp.StatusCode != http.StatusOK {
+			fmt.Println("received non-OK HTTP status for ", resp, resp.Status)
+		}
+
+		// Read the response body
+		// bodyBytes, err := ioutil.ReadAll(resp.Body)
+		// if err != nil {
+		// 	fmt.Println("failed to read response body from", bodyBytes, err)
+		// }
+
 	}
 
 	// // Print the data to the console
-	//fmt.Println("##### Insert into Database #####")
-	//fmt.Println("Msisdn : " + transactionData.Msisdn)
+	// fmt.Println("##### Insert into Database #####")
+	// fmt.Println("Msisdn : " + transactionData.Msisdn)
 	// fmt.Println("Shortcode : " + transactionData.Shortcode)
 	// fmt.Println("Operator  : " + transactionData.Operator)
 	// fmt.Println("Action  : " + transactionData.Action)
 	// fmt.Println("Code  : " + transactionData.Code)
 	// fmt.Println("Desc  : " + transactionData.Desc)
-	//fmt.Println("Timestamp  : " + strconv.FormatInt(int64(transactionData.Timestamp)))
+	// fmt.Println("Timestamp  : " + strconv.FormatInt(int64(transactionData.Timestamp)))
 	// fmt.Println("TranRef  : " + transactionData.TranRef)
 	// fmt.Println("Action  : " + transactionData.Action)
 	// fmt.Println("RefId  : " + transactionData.RefId)
@@ -164,8 +277,10 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	}
 
 	if errInsertDB := db.Create(&logEntry).Error; errInsertDB != nil {
+		redis_del_key := "tmvh-transaction-callback-api:" + transactionData.TranRef
+		rdb.Del(ctx, redis_del_key).Result()
 		fmt.Println("ERROR INSERT : " + errInsertDB.Error())
-		return fmt.Errorf(errInsertDB.Error())
+		//return fmt.Errorf(errInsertDB.Error())
 	}
 
 	redis_set_key := "tmvh-transaction-log-worker:" + transactionData.TranRef
@@ -174,7 +289,7 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	errSetRedis := rdb.Set(ctx, redis_set_key, jsonString, ttl).Err()
 	if errSetRedis != nil {
 		fmt.Println("Redis SET error:", errSetRedis)
-		return fmt.Errorf("REDIS SET ERROR : " + errSetRedis.Error())
+		//return fmt.Errorf("REDIS SET ERROR : " + errSetRedis.Error())
 	}
 
 	redis_del_key := "tmvh-transaction-callback-api:" + transactionData.TranRef
