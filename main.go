@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid" // Import the UUID package
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -264,8 +265,9 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 
 	//defer wg.Done() // Mark this goroutine as done when it exits
 
+	insertId := uuid.New()
 	logEntry := tmvh_transaction_logs{
-		ID:            transactionData.TranRef,
+		ID:            insertId.String(),
 		Code:          transactionData.Code,
 		Description:   transactionData.Desc,
 		Msisdn:        transactionData.Msisdn,
