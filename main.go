@@ -135,6 +135,7 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	if errTransactionnData != nil {
 		fmt.Println("JSON Marshal error : ", errTransactionnData)
 		//return fmt.Errorf("JSON DECODE ERROR : " + errTransactionnData.Error())
+		return nil
 	}
 
 	type PartnerData struct {
@@ -174,6 +175,7 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	if errPartnerData != nil {
 		fmt.Println("partnerData : ", errPartnerData)
 		//return fmt.Errorf("partnerData : " + errPartnerData.Error())
+		return nil
 	}
 
 	partnerDataEntry := client_services{
@@ -231,12 +233,14 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 		resp, err := client.Get(paramTargetURL)
 		if err != nil {
 			fmt.Println("failed to make GET request to ", resp, err)
+			return nil
 		}
 		defer resp.Body.Close() // Ensure the response body is closed after reading
 
 		// Check the HTTP status code
 		if resp.StatusCode != http.StatusOK {
 			fmt.Println("received non-OK HTTP status for ", resp, resp.Status)
+			return nil
 		}
 
 		// Read the response body
@@ -283,6 +287,7 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 		rdb.Del(ctx, redis_del_key).Result()
 		fmt.Println("ERROR INSERT : " + errInsertDB.Error())
 		//return fmt.Errorf(errInsertDB.Error())
+		return nil
 	}
 
 	redis_set_key := "tmvh-transaction-log-worker:" + transactionData.TranRef
@@ -292,6 +297,7 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 	if errSetRedis != nil {
 		fmt.Println("Redis SET error:", errSetRedis)
 		//return fmt.Errorf("REDIS SET ERROR : " + errSetRedis.Error())
+		return nil
 	}
 
 	redis_del_key := "tmvh-transaction-callback-api:" + transactionData.TranRef
