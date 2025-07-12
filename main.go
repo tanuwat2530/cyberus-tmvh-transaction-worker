@@ -12,25 +12,31 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid" // Import the UUID package
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
+// main sets up the database and Redis connections and starts the background worker.
 func main() {
-	// Start background worker in a goroutine
+	// It's better to load these from environment variables for security and flexibility.
 	redisConnection := os.Getenv("BN_REDIS_URL")
 	dbConnection := os.Getenv("BN_DB_URL")
-	//config redis pool
+
+	if redisConnection == "" || dbConnection == "" {
+		log.Fatal("BN_REDIS_URL and BN_DB_URL environment variables must be set.")
+	}
+
+	// Configure Redis client with a connection pool.
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisConnection, // Change if needed
-		Password: "",              // No password by default
-		DB:       0,               // Default DB
-		PoolSize: 100,             //Connection pools
+		Addr:     redisConnection,
+		Password: "",  // No password by default
+		DB:       0,   // Default DB
+		PoolSize: 100, // Connection pools
 	})
 
-	//config database pool
+	// Configure database client with a connection pool.
 	db, errDatabase := gorm.Open(postgres.Open(dbConnection), &gorm.Config{})
 	if errDatabase != nil {
 		log.Fatal("Failed to connect to database:", errDatabase)
@@ -39,71 +45,81 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to get generic database object:", err)
 	}
-	// Set connection pool settings
-	sqlDB.SetMaxOpenConns(100)                // Maximum number of open connections
-	sqlDB.SetMaxIdleConns(10)                 // Maximum number of idle connections
-	sqlDB.SetConnMaxLifetime(5 * time.Minute) // Connection max lifetime
+
+	// Set connection pool settings for the database.
+	sqlDB.SetMaxOpenConns(100)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+
+	// Start the background worker in a separate goroutine.
 	go backgroundWorker(rdb, db)
 
-	// Keep main running so the program doesn't exit
-	select {} // This blocks forever
+	log.Println("Application started successfully. Background worker is running.")
+	// Keep the main function running indefinitely so the background goroutine can live.
+	select {}
 }
 
-// This is the background job that runs forever
+// backgroundWorker continuously scans Redis for jobs and dispatches them to worker goroutines.
 func backgroundWorker(rdb *redis.Client, db *gorm.DB) {
-
 	var ctx = context.Background()
-	var WAIT_INTERVAL = (27 * time.Second)
+	const WAIT_INTERVAL = 17 * time.Second // Reduced wait time for more responsive scanning
 	var cursor uint64 = 0
-	var matchPattern = "tmvh-transaction-callback-api:*" // Pattern to match keys
-	var count = int64(100)                               // Limit to 100 keys per scan
+	const matchPattern = "tmvh-transaction-callback-api:*"
+	const count = int64(100)
 
-	fmt.Println("##### TMVH TRANSACTION WORKER RUNNING DON'T CLOSE TERMINAL #####")
+	log.Println("##### TMVH TRANSACTION WORKER RUNNING #####")
 
 	var wg sync.WaitGroup
 
 	for {
-
-		// Perform the scan with the match pattern and count
+		// Perform the Redis scan.
 		keys, newCursor, err := rdb.Scan(ctx, cursor, matchPattern, count).Result()
 		if err != nil {
-			panic(err)
+			// FIX: Instead of panicking, log the error and wait before retrying.
+			// This makes the worker resilient to temporary Redis connection issues.
+			log.Printf("ERROR scanning Redis: %v. Retrying in %s", err, WAIT_INTERVAL)
+			time.Sleep(WAIT_INTERVAL)
+			continue // Continue to the next loop iteration.
 		}
-		if len(keys) > 0 {
-			//fmt.Printf("number of key : %d\n", len(keys))
-			for i := 0; i < len(keys); i++ {
-				//fmt.Printf("key[%d] : ", i)
-				//fmt.Println(keys[i])
 
-				//fmt.Println("Send Key to Worker : ", keys[i]) // Print only the first key
-				// Example: Get the value of the key (assuming it's a string)
-				valJson, err := rdb.Get(ctx, keys[i]).Result()
+		if len(keys) > 0 {
+			log.Printf("Found %d keys to process in this batch.", len(keys))
+			for i, key := range keys {
+				valJson, err := rdb.Get(ctx, key).Result()
 				if err != nil {
-					log.Fatal("Error getting value : ", err)
-				} else {
-					// Start multiple goroutines (threads)
-					wg.Add(1)
-					go threadWorker(i, &wg, valJson, rdb, ctx, db)
+					// FIX: Instead of log.Fatal, log the error and skip this specific key.
+					// This allows the worker to continue with other keys in the batch.
+					log.Printf("ERROR getting value for key %s: %v. Skipping.", key, err)
+					continue
 				}
+
+				wg.Add(1)
+				// Pass the original Redis key to the worker for reliable deletion later.
+				go threadWorker(i, &wg, valJson, rdb, ctx, db, key)
 			}
 		}
-		// Update cursor for the next iteration
-		cursor = newCursor
-		// If the cursor is 0, then the scan is complete
-		if cursor == 0 {
-			//fmt.Println("Wait for next scan")
-			time.Sleep(WAIT_INTERVAL)
-			//break
-		}
-		wg.Wait() // Block here until all goroutines call Done()
-	}
-	//}
 
+		cursor = newCursor
+		// If the cursor is 0, the scan of the entire keyspace is complete for now.
+		if cursor == 0 {
+			time.Sleep(WAIT_INTERVAL)
+		}
+
+		// Block here until all goroutines in the current batch have called wg.Done().
+		wg.Wait()
+	}
 }
 
-// Function that simulates work for a thread
-func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Client, ctx context.Context, db *gorm.DB) error {
+// threadWorker processes a single job from Redis.
+func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Client, ctx context.Context, db *gorm.DB, redisKey string) {
+	// FIX: Defer wg.Done() at the top. This is the most critical fix.
+	// It guarantees that the WaitGroup is notified that this goroutine has finished,
+	// regardless of where the function returns. This prevents the program from hanging.
+	defer wg.Done()
 
+	log.Printf("Worker %d: Started processing key: %s", id, redisKey)
+
+	// Struct definitions
 	type TransactionData struct {
 		Code         string `json:"code"`
 		Desc         string `json:"desc"`
@@ -115,7 +131,6 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 		ReturnStatus string `json:"cyberus-return"`
 	}
 
-	//Table name on database
 	type tmvh_transaction_logs struct {
 		ID            string `gorm:"primaryKey"`
 		Code          string `gorm:"column:code"`
@@ -127,151 +142,72 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 		Timestamp     int64  `gorm:"column:timestamp"`
 		CyberusReturn string `gorm:"column:cyberus_return"`
 	}
-	//	fmt.Printf("Worker No : %d\n start", id)
 
-	// Convert struct to JSON string
-	var transactionData TransactionData
-	errTransactionnData := json.Unmarshal([]byte(jsonString), &transactionData)
-	if errTransactionnData != nil {
-		fmt.Println("JSON Marshal error : ", errTransactionnData)
-		//return fmt.Errorf("JSON DECODE ERROR : " + errTransactionnData.Error())
-		return nil
-	}
-
-	type PartnerData struct {
-		Id                uint   `json:"id"`
-		Keyword           string `json:"keyword"`
-		Shortcode         string `json:"shortcode"`
-		Telcoid           string `json:"telcoid"`
-		Ads_id            string `json:"ads_id"`
-		Client_partner_id string `json:"client_partner_id"`
-		Wap_aoc_refid     int    `json:"wap_aoc_refid"`
-		Wap_aoc_id        string `json:"wap_aoc_id"`
-		Wap_aoc_media     int    `json:"wap_aoc_media"`
-		Postback_url      string `json:"postback_url"`
-		Dn_url            string `json:"dn_url"`
-		Postback_counter  int    `json:"postback_counter"`
-	}
-
-	//Table name on database
 	type client_services struct {
-		//ID is the primary key, auto-incremented by the database sequence.
 		ID              uint   `gorm:"column:id;primaryKey"`
-		Keyword         string `gorm:"column:keyword"`                    // varchar NULL in SQL, using pointer for explicit nullability
-		Shortcode       string `gorm:"column:shortcode"`                  // varchar NULL in SQL, using pointer for explicit nullability
-		TelcoID         string `gorm:"column:telcoid"`                    // varchar NULL in SQL, using pointer for explicit nullability
-		AdsID           string `gorm:"column:ads_id"`                     // varchar NULL in SQL, using pointer for explicit nullability
-		ClientPartnerID string `gorm:"column:client_partner_id;not null"` // varchar NOT NULL in SQL
-		WapAOCRefID     string `gorm:"column:wap_aoc_refid"`              // varchar NULL in SQL, using pointer for explicit nullability
-		WapAOCID        string `gorm:"column:wap_aoc_id"`                 // varchar NULL in SQL, using pointer for explicit nullability
-		WapAOCMedia     string `gorm:"column:wap_aoc_media"`              // varchar NULL in SQL, using pointer for explicit nullability
-		PostbackURL     string `gorm:"column:postback_url"`               // varchar NULL in SQL, using pointer for explicit nullability
-		DNURL           string `gorm:"column:dn_url"`                     // varchar NULL in SQL, using pointer for explicit nullability
-		PostbackCounter int    `gorm:"column:postback_counter"`           // int4 NULL in SQL, using pointer for explicit nullability
+		DNURL           string `gorm:"column:dn_url"`
+		PostbackURL     string `gorm:"column:postback_url"`
+		PostbackCounter int    `gorm:"column:postback_counter"`
 	}
 
-	var partnerData PartnerData
-	errPartnerData := json.Unmarshal([]byte(jsonString), &partnerData)
-	if errPartnerData != nil {
-		fmt.Println("partnerData : ", errPartnerData)
-		//return fmt.Errorf("partnerData : " + errPartnerData.Error())
-		return nil
+	// Unmarshal the primary transaction data. If this fails, we cannot proceed.
+	var transactionData TransactionData
+	if err := json.Unmarshal([]byte(jsonString), &transactionData); err != nil {
+		log.Printf("Worker %d: ERROR - JSON Unmarshal failed for key %s: %v", id, redisKey, err)
+		// We will delete the invalid key from Redis to prevent it from being processed again.
+		rdb.Del(ctx, redisKey)
+		return // Exit this goroutine.
 	}
 
-	partnerDataEntry := client_services{
-		DNURL:           partnerData.Dn_url,
-		PostbackURL:     partnerData.Postback_url,
-		PostbackCounter: int(partnerData.Postback_counter),
-	}
-
+	// --- Optional HTTP Call ---
+	var partnerDataEntry client_services
 	var telco_operator = "0"
 	if transactionData.Operator == "TRUEMOVE" {
 		telco_operator = "1"
-	}
-	if transactionData.Operator == "DTAC" {
+	} else if transactionData.Operator == "DTAC" {
 		telco_operator = "2"
-	}
-	if transactionData.Operator == "AIS" {
+	} else if transactionData.Operator == "AIS" {
 		telco_operator = "3"
 	}
+
 	queryRes := db.Where("shortcode = ? and telcoid = ?", transactionData.Shortcode, telco_operator).First(&partnerDataEntry)
 	if queryRes.Error != nil {
 		if queryRes.Error == gorm.ErrRecordNotFound {
-			fmt.Println("not found.")
+			log.Printf("Worker %d: INFO - Partner data not found for key %s. Skipping HTTP call.", id, redisKey)
 		} else {
-			log.Printf("Error finding : %v", queryRes.Error)
+			log.Printf("Worker %d: WARNING - DB query failed for key %s: %v. Skipping HTTP call.", id, redisKey, queryRes.Error)
 		}
-	} else {
-
-		//fmt.Println("DN URL : ", partnerDataEntry.DNURL)
-		//fmt.Println("POSTBACK URL : ", partnerDataEntry.PostbackURL)
-		//fmt.Println("COUNTER : ", partnerDataEntry.PostbackCounter)
-		// Define parameters as a map
-		params := map[string]string{
-			"msisdn":     transactionData.Msisdn,
-			"operator":   transactionData.Operator, // Value with spaces
-			"tran_ref":   transactionData.TranRef,  // Another value with spaces and special char
-			"short_code": transactionData.Shortcode,
-			"code":       transactionData.Code,
-			"desc":       transactionData.Desc,
-			"timestamp":  strconv.FormatInt(int64(transactionData.Timestamp), 10),
-		}
-		// Use url.Values to build and URL-encode the query string
+	} else if partnerDataEntry.DNURL != "" {
+		// This block only runs if the DB query was successful and a DNURL exists.
 		queryParams := url.Values{}
-		for key, value := range params {
-			queryParams.Add(key, value) // Automatically encodes key and value
-		}
-		// Construct the full URL with the encoded query string
+		queryParams.Add("msisdn", transactionData.Msisdn)
+		queryParams.Add("operator", transactionData.Operator)
+		queryParams.Add("tran_ref", transactionData.TranRef)
+		queryParams.Add("short_code", transactionData.Shortcode)
+		queryParams.Add("code", transactionData.Code)
+		queryParams.Add("desc", transactionData.Desc)
+		queryParams.Add("timestamp", strconv.FormatInt(int64(transactionData.Timestamp), 10))
+
 		paramTargetURL := fmt.Sprintf("%s?%s", partnerDataEntry.DNURL, queryParams.Encode())
-		//log.Printf("GET request URL with parameters: %s", paramTargetURL)
-		// Create an HTTP client with a timeout
-		client := http.Client{
-			Timeout: 10 * time.Second, // Set a timeout for the request
-		}
+		client := http.Client{Timeout: 10 * time.Second}
 
-		// Make the HTTP GET request
 		resp, err := client.Get(paramTargetURL)
+		// FIX: Log HTTP errors but do not stop the worker's main job (DB insert).
 		if err != nil {
-			fmt.Println("failed to make GET request to ", resp, err)
-			return nil
+			log.Printf("Worker %d: WARNING - HTTP GET request failed for key %s: %v", id, redisKey, err)
+		} else {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("Worker %d: WARNING - Received non-OK HTTP status for key %s: %s", id, redisKey, resp.Status)
+			} else {
+				log.Printf("Worker %d: INFO - Successfully sent DN ping for key %s", id, redisKey)
+			}
 		}
-		defer resp.Body.Close() // Ensure the response body is closed after reading
-
-		// Check the HTTP status code
-		if resp.StatusCode != http.StatusOK {
-			fmt.Println("received non-OK HTTP status for ", resp, resp.Status)
-			return nil
-		}
-
-		// Read the response body
-		// bodyBytes, err := ioutil.ReadAll(resp.Body)
-		// if err != nil {
-		// 	fmt.Println("failed to read response body from", bodyBytes, err)
-		// }
-
 	}
 
-	// // Print the data to the console
-	// fmt.Println("##### Insert into Database #####")
-	// fmt.Println("Msisdn : " + transactionData.Msisdn)
-	// fmt.Println("Shortcode : " + transactionData.Shortcode)
-	// fmt.Println("Operator  : " + transactionData.Operator)
-	// fmt.Println("Action  : " + transactionData.Action)
-	// fmt.Println("Code  : " + transactionData.Code)
-	// fmt.Println("Desc  : " + transactionData.Desc)
-	// fmt.Println("Timestamp  : " + strconv.FormatInt(int64(transactionData.Timestamp)))
-	// fmt.Println("TranRef  : " + transactionData.TranRef)
-	// fmt.Println("Action  : " + transactionData.Action)
-	// fmt.Println("RefId  : " + transactionData.RefId)
-	// fmt.Println("Media  : " + transactionData.Media)
-	// fmt.Println("Token  : " + transactionData.Token)
-	// fmt.Println("CyberusReturn  : " + transactionData.ReturnStatus)
-
-	//defer wg.Done() // Mark this goroutine as done when it exits
-
-	insertId := uuid.New()
+	// --- Critical Database Insert ---
 	logEntry := tmvh_transaction_logs{
-		ID:            insertId.String(),
+		ID:            uuid.New().String(),
 		Code:          transactionData.Code,
 		Description:   transactionData.Desc,
 		Msisdn:        transactionData.Msisdn,
@@ -282,28 +218,25 @@ func threadWorker(id int, wg *sync.WaitGroup, jsonString string, rdb *redis.Clie
 		CyberusReturn: transactionData.ReturnStatus,
 	}
 
-	if errInsertDB := db.Create(&logEntry).Error; errInsertDB != nil {
-		redis_del_key := "tmvh-transaction-callback-api:" + transactionData.TranRef
-		rdb.Del(ctx, redis_del_key).Result()
-		fmt.Println("ERROR INSERT : " + errInsertDB.Error())
-		//return fmt.Errorf(errInsertDB.Error())
-		return nil
+	if err := db.Create(&logEntry).Error; err != nil {
+		// FIX: If the main DB insert fails, log it and exit without deleting the Redis key.
+		// This allows the job to be picked up and retried on the next scan.
+		log.Printf("Worker %d: ERROR - Database insert failed for key %s: %v. Task will be retried.", id, redisKey, err)
+		return
 	}
 
+	// --- Final Redis Operations ---
 	redis_set_key := "tmvh-transaction-log-worker:" + transactionData.TranRef
-	ttl := 240 * time.Hour // expires in 10 day
-	// Set key with TTL
-	errSetRedis := rdb.Set(ctx, redis_set_key, jsonString, ttl).Err()
-	if errSetRedis != nil {
-		fmt.Println("Redis SET error:", errSetRedis)
-		//return fmt.Errorf("REDIS SET ERROR : " + errSetRedis.Error())
-		return nil
+	ttl := 240 * time.Hour // expires in 10 days
+	if err := rdb.Set(ctx, redis_set_key, jsonString, ttl).Err(); err != nil {
+		// FIX: Log this error but don't stop. The critical DB work is done.
+		log.Printf("Worker %d: WARNING - Redis SET confirmation key failed for key %s: %v", id, redisKey, err)
 	}
 
-	redis_del_key := "tmvh-transaction-callback-api:" + transactionData.TranRef
-	rdb.Del(ctx, redis_del_key).Result()
+	// Clean up the original Redis key since the job was processed successfully.
+	if err := rdb.Del(ctx, redisKey).Err(); err != nil {
+		log.Printf("Worker %d: WARNING - Failed to delete original key %s from Redis: %v", id, redisKey, err)
+	}
 
-	wg.Done()
-	fmt.Printf("Transaction worker No : %d finished\n", id)
-	return nil
+	log.Printf("Worker %d: Finished processing key %s successfully.", id, redisKey)
 }
